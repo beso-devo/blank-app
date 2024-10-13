@@ -9,7 +9,7 @@ secrets = toml.load('.streamlit/secrets.toml')
 
 # Extract Google API credentials
 google_api_credentials = json.loads(secrets['google_api']['credentials'])
-
+print("");
 # Define scope for Google Sheets API
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
