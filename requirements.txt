@@ -10,8 +10,5 @@
 
 streamlit
 pandas
-requests
-datetime
-collections
 
 # updated.
