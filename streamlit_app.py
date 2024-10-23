@@ -821,17 +821,30 @@
 import streamlit as st
 import pandas as pd
 from datetime import timedelta, datetime
+from datetime import datetime
+from collections import defaultdict
+import os
+import requests
 
 # Set page config
 st.set_page_config(page_title="Arabee Dashboard CRP22", layout="wide")
+theme_mode = "dark";
 
 # Helper functions
 @st.cache_data
-def load_data():
-    data = pd.read_csv("youtube_channel_data.csv")
+def load_data(filename):
+    data = pd.read_csv(filename)
     data['DATE'] = pd.to_datetime(data['DATE'])
     data['NET_SUBSCRIBERS'] = data['SUBSCRIBERS_GAINED'] - data['SUBSCRIBERS_LOST']
     return data
+
+def load_invoices_data(filename):
+    data = pd.read_csv(filename)
+    data['DATE'] = pd.to_datetime(data['DATE'])
+    data['NET_SUBSCRIBERS'] = 0
+
+    return data
+
 
 def custom_quarter(date):
     month = date.month
@@ -845,37 +858,23 @@ def custom_quarter(date):
     else:  # month in [11, 12, 1]
         return pd.Period(year=year if month != 1 else year-1, quarter=4, freq='Q')
 
-def aggregate_data(df, freq):
+def aggregate_data(df, freq, cols):
     if freq == 'Q':
         df = df.copy()
         df['CUSTOM_Q'] = df['DATE'].apply(custom_quarter)
-        df_agg = df.groupby('CUSTOM_Q').agg({
-            'VIEWS': 'sum',
-            'WATCH_HOURS': 'sum',
-            'NET_SUBSCRIBERS': 'sum',
-            'LIKES': 'sum',
-            'COMMENTS': 'sum',
-            'SHARES': 'sum',
-        })
+        df_agg = df.groupby('CUSTOM_Q').agg(cols)
         return df_agg
     else:
-        return df.resample(freq, on='DATE').agg({
-            'VIEWS': 'sum',
-            'WATCH_HOURS': 'sum',
-            'NET_SUBSCRIBERS': 'sum',
-            'LIKES': 'sum',
-            'COMMENTS': 'sum',
-            'SHARES': 'sum',
-        })
+        return df.resample(freq, on='DATE').agg(cols)
 
-def get_weekly_data(df):
-    return aggregate_data(df, 'W-MON')
+def get_weekly_data(df, cols={}):
+    return aggregate_data(df, 'W-MON', cols)
 
-def get_monthly_data(df):
-    return aggregate_data(df, 'M')
+def get_monthly_data(df, cols={}):
+    return aggregate_data(df, 'M', cols)
 
-def get_quarterly_data(df):
-    return aggregate_data(df, 'Q')
+def get_quarterly_data(df, cols={}):
+    return aggregate_data(df, 'Q', cols)
 
 def format_with_commas(number):
     return f"{number:,}"
@@ -916,18 +915,130 @@ def display_metric(col, title, value, df, column, color, time_frame):
         with st.container(border=True):
             delta, delta_percent = calculate_delta(df, column)
             delta_str = f"{delta:+,.0f} ({delta_percent:+.2f}%)"
-            st.metric(title, format_with_commas(value), delta=delta_str)
+            st.metric(title, format_with_commas(int(value)) + "~", delta=delta_str)
             create_metric_chart(df, column, color, time_frame=time_frame, chart_type=chart_selection)
             
             last_period = df.index[-1]
             freq = {'Daily': 'D', 'Weekly': 'W', 'Monthly': 'M', 'Quarterly': 'Q'}[time_frame]
             if not is_period_complete(last_period, freq):
                 st.caption(f"Note: The last {time_frame.lower()[:-2] if time_frame != 'Daily' else 'day'} is incomplete.")
+                
+# functions for generate the CSV frm API
+def fetch_invoice_data(start_date, end_date):
+    url = "https://staging.api.crp22.yhh.ae/items/invoices"
+    headers = {
+        "Authorization": "Bearer r3XYt4SgbI61JWUraxtD3aTzMcy4nc9X"    
+    }
+    params = {
+        "limit": 3000,
+        "filter[firebase_formatted_date][_between]": f"{start_date},{end_date}",
+    }
+    response = requests.get(url, params=params, headers=headers)
+    if response.status_code == 200:
+        print(response.json()['data'])
+        return response.json()['data']
+    else:
+        st.error(f"Failed to fetch data: {response.status_code}")
+        return None
 
-# Load data
-df = load_data()
 
-# Set up input widgets
+def process_aggregation_invoices(invoices):
+    """Process invoices and aggregate by date"""
+    daily_data = defaultdict(lambda: {'total_amount': 0, 'count': 0})
+    
+    for invoice in invoices:
+        if invoice['firebase_formatted_date'] is not None:
+        # Convert date string to date object (take only the date part)
+            date_created = datetime.strptime(invoice['firebase_formatted_date'], '%Y-%m-%dT%H:%M:%S').date()
+        
+        # Convert amount to float (assuming it's stored as number)
+        amount = invoice['Amount_In_USD']
+        value = 0;
+        if amount is not None:
+            # Aggregate data
+           daily_data[date_created]['total_amount'] +=  int(amount)
+        daily_data[date_created]['count'] += 1
+    
+    # Convert to DataFrame
+    df = pd.DataFrame([
+        {
+            'DATE': date,
+            'TOTAL_AMOUNT_DAY': data['total_amount'],
+            'TOTAL_INVOICES_DAY': data['count']
+        }
+        for date, data in daily_data.items()
+    ])
+    
+    # Sort by date
+    df = df.sort_values('DATE')
+    
+    return df
+
+def process_invoices(invoices):
+    """Process invoices day by day without aggregation"""
+    # Prepare data for DataFrame
+    processed_data = []
+    
+    for invoice in invoices:
+        # Convert date string to date object (take only the date part)
+        if invoice['firebase_formatted_date'] is not None:
+            date_created = datetime.strptime(invoice['firebase_formatted_date'], '%Y-%m-%dT%H:%M:%S').date()
+        
+        # Convert amount to float
+        amount = invoice['Amount_In_USD']
+        if amount is None:
+            amount = 0;
+        
+        processed_data.append({
+            'DATE': date_created,
+            'AMOUNT_IN_USD': amount,
+            'SOURCE_AMOUNT': invoice["amount"],
+            "SOURCE_CURRENCY": invoice["Source_Amount_In"],
+            "EMAIL": invoice['buyer_email'],
+            "PLAN_NAME": invoice["title"],
+            "PLAN_ID": invoice["product_plan_id"]
+        })
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(processed_data)
+    
+    # Sort by date
+    df = df.sort_values('DATE')
+    
+    return df
+
+
+def save_to_csv(df, filename='daily_invoice_summary.csv'):
+    """Save DataFrame to CSV file"""
+    try:
+        df.to_csv(filename, index=False)
+        return True
+    except Exception as e:
+        st.error(f"Error saving CSV: {str(e)}")
+        return False
+
+def getDFDisplay(dataDF, cols={}):
+    if time_frame == 'Daily':
+        dfd = dataDF.set_index('DATE')
+    elif time_frame == 'Weekly':
+        dfd = get_weekly_data(dataDF, cols)
+    elif time_frame == 'Monthly':
+        dfd = get_monthly_data(dataDF, cols)
+    elif time_frame == 'Quarterly':
+        dfd = get_quarterly_data(dataDF, cols)
+    return dfd;
+        
+def init_session_state():
+    if "theme" not in st.session_state:
+        theme_mode = "light"
+
+# # Load data
+# df = load_data("youtube_channel_data.csv")
+start_date = "2023-01-18"
+end_date = "2025-10-19"
+
+
+# # Set up input widgets
 st.logo(image="images/streamlit-logo-primary-colormark-lighttext.png", 
         icon_image="images/streamlit-mark-color.png")
 
@@ -935,56 +1046,114 @@ with st.sidebar:
     st.title("Arabee Dashboard CRP22")
     st.header("⚙️ Settings")
     
-    max_date = df['DATE'].max().date()
+    max_date = datetime.now()
     default_start_date = max_date - timedelta(days=365)  # Show a year by default
     default_end_date = max_date
-    start_date = st.date_input("Start date", default_start_date, min_value=df['DATE'].min().date(), max_value=max_date)
-    end_date = st.date_input("End date", default_end_date, min_value=df['DATE'].min().date(), max_value=max_date)
+    start_date = st.date_input("Start date", default_start_date, max_value=max_date)
+    end_date = st.date_input("End date", default_end_date, max_value=max_date)
     time_frame = st.selectbox("Select time frame",
                               ("Daily", "Weekly", "Monthly", "Quarterly"),
     )
     chart_selection = st.selectbox("Select a chart type",
                                    ("Bar", "Area"))
+    theme_switch = st.toggle('Dark Mode', value=theme_mode == "dark")
+ 
 
-# Prepare data based on selected time frame
-if time_frame == 'Daily':
-    df_display = df.set_index('DATE')
-elif time_frame == 'Weekly':
-    df_display = get_weekly_data(df)
-elif time_frame == 'Monthly':
-    df_display = get_monthly_data(df)
-elif time_frame == 'Quarterly':
-    df_display = get_quarterly_data(df)
+invoices = fetch_invoice_data(start_date, end_date)
+if invoices:
+    aggregationInvoices = process_aggregation_invoices(invoices)
+    normalInvoices = process_invoices(invoices)
+    save_to_csv(aggregationInvoices)   
+    save_to_csv(normalInvoices, filename="normal_invoices.csv")  
+    aggregationInvoicesDF = load_invoices_data("daily_invoice_summary.csv")
+    normalInvoicesDF = load_invoices_data("normal_invoices.csv")
 
-# Display Key Metrics
-st.subheader("All-Time Statistics")
+    aggregationInvoicesDF_diplay_item = getDFDisplay(aggregationInvoicesDF, {
+                'TOTAL_AMOUNT_DAY': 'sum',
+                'TOTAL_INVOICES_DAY': 'sum',
+            })
+    normalInvoicesDF_diplay_item = getDFDisplay(normalInvoicesDF,{
+                'AMOUNT_IN_USD': 'sum',
+                'SOURCE_AMOUNT': 'sum',
+            })
 
-metrics = [
-    ("Total Subscribers", "NET_SUBSCRIBERS", '#29b5e8'),
-    ("Total Views", "VIEWS", '#FF9F36'),
-    ("Total Watch Hours", "WATCH_HOURS", '#D45B90'),
-    ("Total Likes", "LIKES", '#7D44CF')
-]
 
-cols = st.columns(4)
-for col, (title, column, color) in zip(cols, metrics):
-    total_value = df[column].sum()
-    display_metric(col, title, total_value, df_display, column, color, time_frame)
+    aggregatedInvoicesMetrics = [
+        ("Total Amount", "TOTAL_AMOUNT_DAY", '#29b5e8'),
+        ("Total Invoices", "TOTAL_INVOICES_DAY", '#FF9F36'),
+    ]
 
-st.subheader("Selected Duration")
+    normalInvoicesMetrics = [
+        ("USD Amount", "AMOUNT_IN_USD", '#29b5e8'),
+        # ("Source Amount", "SOURCE_AMOUNT", '#7D44CF'),
+    ]
 
-if time_frame == 'Quarterly':
-    start_quarter = custom_quarter(start_date)
-    end_quarter = custom_quarter(end_date)
-    mask = (df_display.index >= start_quarter) & (df_display.index <= end_quarter)
+    st.subheader("Aggregated Arabee Family Invoices")
+
+    with st.expander('Aggregated Arabee Invoices (CSV)'):
+        st.dataframe(aggregationInvoices)
+
+    cols = st.columns(2)
+    for col, (title, column, color) in zip(cols, aggregatedInvoicesMetrics):
+        total_value = aggregationInvoicesDF[column].sum()
+        display_metric(col, title, total_value, aggregationInvoicesDF_diplay_item, column, color, time_frame)
+
+
+    st.subheader("Normal Arabee Family Invoices")
+
+    with st.expander('See Arabee Invoices (CSV)'):
+        st.dataframe(normalInvoices)
+    
+    cols = st.columns(2)
+    for col, (title, column, color) in zip(cols, normalInvoicesMetrics):
+        total_value = normalInvoicesDF[column].sum()
+        display_metric(col, title, total_value, normalInvoicesDF_diplay_item, column, color, time_frame)
 else:
-    mask = (df_display.index >= pd.Timestamp(start_date)) & (df_display.index <= pd.Timestamp(end_date))
-df_filtered = df_display.loc[mask]
+    st.error("No data found!")
+           
+# # Prepare data based on selected time frame
+# if time_frame == 'Daily':
+#     df_display = df.set_index('DATE')
+# elif time_frame == 'Weekly':
+#     df_display = get_weekly_data(df)
+# elif time_frame == 'Monthly':
+#     df_display = get_monthly_data(df)
+# elif time_frame == 'Quarterly':
+#     df_display = get_quarterly_data(df)
 
-cols = st.columns(4)
-for col, (title, column, color) in zip(cols, metrics):
-    display_metric(col, title.split()[-1], df_filtered[column].sum(), df_filtered, column, color, time_frame)
+# # Display Key Metrics
+# st.subheader("All-Time Statistics")
 
-# DataFrame display
-with st.expander('See DataFrame (Selected time frame)'):
-    st.dataframe(df_filtered)
+# metrics = [
+#     ("Total Subscribers", "NET_SUBSCRIBERS", '#29b5e8'),
+#     ("Total Views", "VIEWS", '#FF9F36'),
+#     ("Total Watch Hours", "WATCH_HOURS", '#D45B90'),
+#     ("Total Likes", "LIKES", '#7D44CF')
+# ]
+
+# cols = st.columns(4)
+# for col, (title, column, color) in zip(cols, metrics):
+#     total_value = df[column].sum()
+#     display_metric(col, title, total_value, df_display, column, color, time_frame)
+
+# st.subheader("Selected Duration")
+
+# if time_frame == 'Quarterly':
+#     start_quarter = custom_quarter(start_date)
+#     end_quarter = custom_quarter(end_date)
+#     mask = (df_display.index >= start_quarter) & (df_display.index <= end_quarter)
+# else:
+#     mask = (df_display.index >= pd.Timestamp(start_date)) & (df_display.index <= pd.Timestamp(end_date))
+# df_filtered = df_display.loc[mask]
+
+# cols = st.columns(4)
+# for col, (title, column, color) in zip(cols, metrics):
+#     display_metric(col, title.split()[-1], df_filtered[column].sum(), df_filtered, column, color, time_frame)
+
+# # DataFrame display
+# with st.expander('See DataFrame (Selected time frame)'):
+#     st.dataframe(df_filtered)
+
+#### invoices.
+      
+  
